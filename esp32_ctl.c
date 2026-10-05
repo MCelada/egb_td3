@@ -21,26 +21,35 @@
 void *monitor_thread(void *arg) {
     int fd = *(int *)arg;
     char rx_buffer[BUFFER_SIZE];
+    char line_buffer[BUFFER_SIZE];
+    int line_pos = 0;
     ssize_t bytes_read;
 
     while (1) {
         bytes_read = read(fd, rx_buffer, sizeof(rx_buffer) - 1);
         
         if (bytes_read > 0) {
-            rx_buffer[bytes_read] = '\0';
-            
-            /* Usamos \r para sobreescribir la línea actual y no romper 
-               el prompt del usuario cuando llega telemetría asíncrona */
-            printf("\r\033[K[ESP32] Telemetría: %s", rx_buffer);
-            
-            // Si el buffer no traía su propio salto de línea, lo agregamos
-            if (rx_buffer[bytes_read - 1] != '\n') {
-                printf("\n");
+            for (int i = 0; i < bytes_read; i++) {
+                char c = rx_buffer[i];
+                
+                /* Si llegó el final de la trama */
+                if (c == '\n') {
+                    line_buffer[line_pos] = '\0'; // Terminar la cadena en C
+                    
+                    /* Limpiar línea actual, imprimir respuesta limpia y restaurar prompt */
+                    printf("\r\033[K[ESP32] Telemetría: %s\n", line_buffer);
+                    printf("esp32-ctl> ");
+                    fflush(stdout);
+                    
+                    line_pos = 0; // Reiniciar buffer para la próxima trama
+                } 
+                /* Ignoramos el \r que rompe la terminal, guardamos el resto */
+                else if (c != '\r') {
+                    if (line_pos < BUFFER_SIZE - 1) {
+                        line_buffer[line_pos++] = c;
+                    }
+                }
             }
-            
-            /* Reimprimir el prompt para el hilo principal */
-            printf("esp32-ctl> ");
-            fflush(stdout);
         } else if (bytes_read < 0) {
             perror("\r\033[K[Monitor] Error en read()");
             break;
@@ -141,14 +150,9 @@ int main(int argc, char *argv[]) {
             }
         }
         else if (strcmp(cmd, "get") == 0) {
-            int sync_result = 0;
-            printf("[IOCTL] Enviando PING síncrono...\n");
-            
-            if (ioctl(fd, ESP32_GET, &sync_result) == 0) {
-                printf("[IOCTL] OK - PONG recibido (Status: %d)\n", sync_result);
-            } else {
-                perror("[IOCTL] Error o Timeout");
-            }
+            /* Eliminamos el ioctl y enviamos PING directamente como texto */
+            printf("[TX] Enviando PING directo a la UART...\n");
+            write(fd, "PING\n", 5);
         }
         else {
             printf("Comando desconocido: '%s'. Escribe 'help'.\n", cmd);
