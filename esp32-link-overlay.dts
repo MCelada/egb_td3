@@ -1,0 +1,57 @@
+/dts-v1/;
+/plugin/;
+
+/* esp32-link-overlay.dts
+ * Deshabilita Bluetooth y rutea UART0 (PL011) a los pines GPIO 14 y 15 
+ * para comunicación dedicada con la carga electrónica (ESP32)
+ */
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    /* Fragmento 0: Deshabilitar el nodo de Bluetooth interno */
+    fragment@0 {
+        target = <&bt>;
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+
+    /* Fragmento 1: Deshabilitar la mini UART (UART1) para evitar conflictos */
+    fragment@1 {
+        target = <&uart1>;
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+
+    /* Fragmento 2: Habilitar UART0 y rutear a los pines físicos 14 y 15 */
+    fragment@2 {
+        target = <&uart0>;
+        __overlay__ {
+            pinctrl-names = "default";
+            pinctrl-0 = <&uart0_pins>;
+            status = "okay";
+        };
+    };
+
+    /* Fragmento 3: Reasignar el alias para que aparezca como /dev/serial0 */
+    fragment@3 {
+        target-path = "/aliases";
+        __overlay__ {
+            serial0 = "/soc/serial@7e201000"; /* Dirección base de UART0 */
+            serial1 = "/soc/serial@7e215040"; /* Dirección base de UART1 (deshabilitada) */
+        };
+    };
+};
+
+fragment@4 {
+        target = <&uart0>;
+        __overlay__ {
+            esp32 {
+                compatible = "custom,esp32-link";
+                status = "okay";
+            };
+        };
+    };
+    
