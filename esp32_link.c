@@ -44,11 +44,11 @@ static size_t esp32_link_recv(struct serdev_device *serdev, const unsigned char 
     if (copied > 0)
         wake_up_interruptible(&priv->read_wait);
 
-    if (count > 0 && buf[0] == '{') { 
-        priv->last_sync_result = 0;   
+    /* Si la ESP32 responde PONG, levantamos la barrera del IOCTL */
+    if (count >= 4 && strncmp((const char *)buf, "PONG", 4) == 0) { 
+        priv->last_sync_result = 1; // 1 = OK
         complete(&priv->ioctl_comp);  
     }
-
     return (size_t)copied;
 }
 
@@ -94,7 +94,7 @@ static long esp32_link_ioctl(struct file *file, unsigned int cmd, unsigned long 
     struct esp32_link_dev *priv = file->private_data;
     long ret = 0;
     unsigned long timeout;
-    char sync_req[] = "{\"cmd\":\"get_status\"}\n";
+    char sync_req[] = "PING\n";
 
     switch (cmd) {
     case ESP32_GET:
