@@ -39,16 +39,19 @@ static size_t esp32_link_recv(struct serdev_device *serdev, const unsigned char 
     struct esp32_link_dev *priv = serdev_device_get_drvdata(serdev);
     unsigned int copied;
 
+    /* TRAZA DE DEBUG: Ver si el kernel realmente está recibiendo algo */
+    pr_info("ESP32_LINK: Recibidos %zu bytes por UART\n", count);
+
     copied = kfifo_in(&priv->rx_fifo, buf, count);
     
     if (copied > 0)
         wake_up_interruptible(&priv->read_wait);
 
-    /* Si la ESP32 responde PONG, levantamos la barrera del IOCTL */
-    if (count >= 4 && strncmp((const char *)buf, "PONG", 4) == 0) { 
-        priv->last_sync_result = 1; // 1 = OK
+    if (count > 0 && buf[0] == '{') { 
+        priv->last_sync_result = 0;   
         complete(&priv->ioctl_comp);  
     }
+
     return (size_t)copied;
 }
 
@@ -83,10 +86,18 @@ static ssize_t esp32_link_write(struct file *file, const char __user *buf, size_
     if (IS_ERR(kbuf))
         return PTR_ERR(kbuf);
 
+    /* TRAZA DE DEBUG: Ver qué intenta escribir el usuario */
+    pr_info("ESP32_LINK: Intentando escribir %zu bytes al serdev\n", count);
+
     ret = serdev_device_write_buf(priv->serdev, kbuf, count);
     
+    /* TRAZA DE DEBUG: Ver cuántos bytes aceptó realmente el driver serdev */
+    pr_info("ESP32_LINK: serdev_device_write_buf retorno: %d\n", ret);
+
     kfree(kbuf);
-    return (ret < 0) ? ret : count;
+    
+    /* CORRECCIÓN CRÍTICA: Retornar lo que realmente envió el driver, no un valor ciego */
+    return (ret < 0) ? ret : ret; 
 }
 
 static long esp32_link_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
