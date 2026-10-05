@@ -177,6 +177,8 @@ static int esp32_link_probe(struct serdev_device *serdev)
     serdev_device_set_baudrate(serdev, 115200);
     serdev_device_set_flow_control(serdev, false);
 
+    serdev_device_set_rtscts(serdev, false);
+
     priv->devt = MKDEV(MAJOR(esp32_devt_base), 0);
     cdev_init(&priv->cdev, &esp32_link_fops);
     priv->cdev.owner = THIS_MODULE;
