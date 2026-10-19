@@ -22,10 +22,14 @@ if "link_fd" not in st.session_state:
         "i": 0.0,
         "p": 0.0,
         "setpoint": 0.0,
+        "mode": None,
+        "configured_setpoint": None,
+        "adc_voltage_mv": None,
+        "adc_current_mv": None,
         "medido": 0.0,
         "pwm": 0.0,
-        "v_max_cfg": 30.0,
-        "i_max_cfg": 5.0,
+        "v_max_cfg": 15.0,
+        "i_max_cfg": 0.5,
     }
     st.session_state.history = deque(maxlen=60)
     st.session_state.last_response = ""
@@ -107,14 +111,20 @@ def disconnect():
 def update_telemetry(data):
     voltage = float(data.get("voltage_v", 0.0))
     current = float(data.get("current_a", 0.0))
-    setpoint = float(data.get("target_current_a", 0.0))
+    target_current = float(data.get("target_current_a", 0.0))
     dac_output = int(data.get("dac_output", 0))
+    adc_voltage_mv = data.get("adc_voltage_mv")
+    adc_current_mv = data.get("adc_current_mv")
     st.session_state.current_data.update(
         {
             "v": voltage,
             "i": current,
             "p": voltage * current,
-            "setpoint": setpoint,
+            "setpoint": target_current,
+            "mode": data.get("mode"),
+            "configured_setpoint": data.get("setpoint"),
+            "adc_voltage_mv": float(adc_voltage_mv) if adc_voltage_mv is not None else None,
+            "adc_current_mv": float(adc_current_mv) if adc_current_mv is not None else None,
             "medido": current,
             "pwm": dac_output,
         }
@@ -122,7 +132,7 @@ def update_telemetry(data):
     st.session_state.history.append(
         {
             "Tiempo": data.get("timestamp_us", time.time() * 1_000_000) / 1_000_000,
-            "Setpoint": setpoint,
+            "Objetivo (A)": target_current,
             "Medido": current,
             "Salida DAC": dac_output,
         }
@@ -180,18 +190,58 @@ col1.metric("Tensión (V)", f"{st.session_state.current_data['v']:.3f} V")
 col2.metric("Corriente (A)", f"{st.session_state.current_data['i']:.3f} A")
 col3.metric("Potencia (W)", f"{st.session_state.current_data['p']:.2f} W")
 
+active_mode = st.session_state.current_data.get("mode")
+active_setpoint = st.session_state.current_data.get("configured_setpoint")
+if active_mode == "CR":
+    active_setpoint_text = f"{active_setpoint:.2f} Ω" if active_setpoint is not None else "—"
+elif active_mode == "CC":
+    active_setpoint_text = f"{active_setpoint:.3f} A" if active_setpoint is not None else "—"
+else:
+    active_setpoint_text = "—"
+if active_mode in ("CC", "CR"):
+    st.info(
+        f"Estado informado por ESP32: **{active_mode}** · "
+        f"Consigna: **{active_setpoint_text}** · "
+        f"Corriente objetivo calculada: **{st.session_state.current_data['setpoint']:.3f} A**"
+    )
+else:
+    st.caption("Esperando que la ESP32 envíe modo y consigna activos por UART.")
+
 st.divider()
 col_ctrl, col_lim = st.columns(2)
 
+with st.expander("Diagnóstico de calibración ADC"):
+    adc_voltage_mv = st.session_state.current_data["adc_voltage_mv"]
+    adc_current_mv = st.session_state.current_data["adc_current_mv"]
+    if adc_voltage_mv is None or adc_current_mv is None:
+        st.caption("El firmware actual aún no envía las lecturas ADC de diagnóstico.")
+    else:
+        adc_col1, adc_col2 = st.columns(2)
+        adc_col1.metric("ADC VIN · GPIO1", f"{adc_voltage_mv:.0f} mV")
+        adc_col2.metric("ADC VSENS · GPIO2", f"{adc_current_mv:.0f} mV")
+        st.caption("Lecturas calibradas y filtradas que se usan como entrada de las tablas de escala.")
+
 with col_ctrl:
     st.subheader("Control del lazo")
-    modo = st.radio("Modo de operación", ["Corriente constante (CC)", "Resistencia constante (CR)"])
-    setpoint = st.number_input("Setpoint", min_value=0.0, max_value=20.0, step=0.1)
+    modo = st.radio("Modo a enviar", ["Corriente constante (CC)", "Resistencia constante (CR)"])
+    modo_str = "CC" if "Corriente" in modo else "CR"
+    unidad = "A" if modo_str == "CC" else "Ω"
+    setpoint = st.number_input(f"Consigna a enviar ({unidad})", min_value=0.0, max_value=20.0, step=0.1)
 
-    if st.button("Enviar setpoint"):
-        modo_str = "CC" if "Corriente" in modo else "CR"
+    if modo_str == "CR" and setpoint > 0.0:
+        estimated_current = st.session_state.current_data["v"] / setpoint
+        if estimated_current > 0.20:
+            st.warning(
+                f"Con los {st.session_state.current_data['v']:.2f} V que informa la ESP32 "
+                f"y {setpoint:.2f} Ω, V/R estima {estimated_current:.2f} A. "
+                "El informe solo documenta "
+                "calibración de corriente hasta 0.20 A; verifica el límite real del "
+                "circuito antes de enviar esta consigna."
+            )
+
+    if st.button("Aplicar modo y consigna"):
         if send_command(f"MODE {modo_str}") and send_command(f"SETPOINT {setpoint:.6g}"):
-            st.toast(f"Comando enviado: {modo_str} @ {setpoint:.6g}")
+            st.toast(f"Comando enviado: {modo_str} @ {setpoint:.6g} {unidad}")
         else:
             st.error("No se pudo enviar el comando. Comprueba la conexión UART.")
 
@@ -202,6 +252,7 @@ with col_lim:
         f"Máx V: **{limits['v_max_cfg']:.2f} V** | "
         f"Máx I: **{limits['i_max_cfg']:.2f} A**"
     )
+    st.caption("El firmware solo aplica OVP/OCP después de recibir ARM; el dashboard todavía no envía ese comando.")
     with st.expander("Modificar límites"):
         new_v_max = st.number_input("Nuevo voltaje máximo (V)", min_value=1.0, max_value=50.0, value=limits["v_max_cfg"])
         new_i_max = st.number_input("Nueva corriente máxima (A)", min_value=0.1, max_value=15.0, value=limits["i_max_cfg"])
@@ -219,7 +270,7 @@ st.divider()
 st.subheader("Monitoreo del PID")
 if st.session_state.history:
     chart = pd.DataFrame(st.session_state.history).set_index("Tiempo")
-    st.line_chart(chart[["Setpoint", "Medido", "Salida DAC"]])
+    st.line_chart(chart[["Objetivo (A)", "Medido", "Salida DAC"]])
 else:
     st.caption("Esperando telemetría JSON de la UART...")
 
