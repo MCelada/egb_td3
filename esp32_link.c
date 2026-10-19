@@ -151,7 +151,7 @@ static const struct file_operations esp32_link_fops = {
 	.read = esp32_link_read,
 	.write = esp32_link_write,
 	.poll = esp32_link_poll,
-	.llseek = no_llseek,
+	.llseek = noop_llseek,
 };
 
 static int esp32_link_probe(struct serdev_device *serdev)

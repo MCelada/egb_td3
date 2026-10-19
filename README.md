@@ -22,14 +22,18 @@ Copia esta carpeta a la Pi y ejecuta desde ella:
 
 ```sh
 sudo apt update
-sudo apt install build-essential raspberrypi-kernel-headers device-tree-compiler
+sudo apt install build-essential device-tree-compiler
 make
 ```
 
 `make` compila el modulo contra el kernel que esta corriendo, la consola
 `esp32-ctl` y el overlay Device Tree. Si el enlace `build` de
 `/lib/modules/$(uname -r)/` no existe, instala las cabeceras correspondientes
-al kernel en ejecucion y vuelve a compilar.
+al kernel en ejecucion y vuelve a compilar. El nombre del paquete de cabeceras
+depende de la version de Raspberry Pi OS; si el enlace existe y apunta a un
+directorio como `/usr/src/linux-headers-$(uname -r)`, ya estan disponibles y no
+hace falta instalar otro paquete. En kernels recientes se usa `noop_llseek`
+en lugar del antiguo `no_llseek`.
 
 Instala el overlay en la particion de arranque activa:
 
@@ -92,9 +96,32 @@ El protocolo de texto coincide con `components/uart_bridge/uart_bridge.c` del
 firmware. No ejecutes a la vez otra aplicacion que lea `/dev/esp32_link`: la
 cola de recepcion es compartida y el primer lector consume los bytes.
 
-El dashboard opcional `webpage.py` usa el mismo dispositivo y protocolo. Para
-ejecutarlo, instala `streamlit` y `pandas` en un entorno Python y abre el
-dispositivo con un usuario que tenga permisos de lectura y escritura.
+El dashboard `webpage.py` lee por UART la telemetria que transmite el ESP32 y
+muestra tension, corriente, potencia calculada y una grafica. Para permitir que
+el usuario de Linux que ejecuta Streamlit abra el dispositivo, se puede crear
+una regla udev y agregar ese usuario al grupo `dialout`:
+
+```sh
+echo 'KERNEL=="esp32_link", MODE="0660", GROUP="dialout"' | sudo tee /etc/udev/rules.d/99-esp32-link.rules
+sudo usermod -aG dialout "$USER"
+```
+
+Reinicia la Pi (o cierra y vuelve a abrir la sesion y recarga el modulo) para
+aplicar el grupo y la regla. Luego instala las dependencias y ejecuta Streamlit
+aceptando conexiones de la red local:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install streamlit pandas
+streamlit run webpage.py --server.address 0.0.0.0 --server.port 8501
+```
+
+En la Pi, `hostname -I` muestra su direccion IP. Desde el celular conectado a
+la misma red, abre `http://IP_DE_LA_PI:8501`. La pagina recibe los datos por el
+UART; Wi-Fi/Ethernet solo transporta la pagina web al celular. El dispositivo
+`/dev/esp32_link` debe tener un unico lector a la vez: cierra `esp32-ctl` antes
+de conectar el dashboard.
 
 Para sacar el modulo, primero cierra `esp32-ctl` y ejecuta:
 
