@@ -1,0 +1,13 @@
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+modules.order
+.*.cmd
+.tmp_versions/
+esp32-ctl
+esp32-link.dtbo
+__pycache__/
+.venv/

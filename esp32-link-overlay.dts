@@ -1,57 +1,67 @@
 /dts-v1/;
 /plugin/;
 
-/* esp32-link-overlay.dts
- * Deshabilita Bluetooth y rutea UART0 (PL011) a los pines GPIO 14 y 15 
- * para comunicación dedicada con la carga electrónica (ESP32)
+/*
+ * Raspberry Pi 3 B+: libera el PL011 (UART0) del Bluetooth integrado,
+ * lo asigna a GPIO14/15 (pines fisicos 8/10) y describe al ESP32 como
+ * dispositivo hijo serdev. Este overlay reemplaza a dtoverlay=disable-bt.
  */
-
 / {
-    compatible = "brcm,bcm2835";
+	compatible = "brcm,bcm2835";
 
-    /* Fragmento 0: Deshabilitar el nodo de Bluetooth interno */
-    fragment@0 {
-        target = <&bt>;
-        __overlay__ {
-            status = "disabled";
-        };
-    };
+	fragment@0 {
+		target = <&uart1>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
 
-    /* Fragmento 1: Deshabilitar la mini UART (UART1) para evitar conflictos */
-    fragment@1 {
-        target = <&uart1>;
-        __overlay__ {
-            status = "disabled";
-        };
-    };
+	fragment@1 {
+		target = <&uart0>;
+		__overlay__ {
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart0_pins>;
+			status = "okay";
 
-    /* Fragmento 2: Habilitar UART0 y rutear a los pines físicos 14 y 15 */
-    fragment@2 {
-        target = <&uart0>;
-        __overlay__ {
-            pinctrl-names = "default";
-            pinctrl-0 = <&uart0_pins>;
-            status = "okay";
-        };
-    };
+			esp32-link {
+				compatible = "custom,esp32-link";
+				current-speed = <115200>;
+				status = "okay";
+			};
+		};
+	};
 
-    /* Fragmento 3: Reasignar el alias para que aparezca como /dev/serial0 */
-    fragment@3 {
-        target-path = "/aliases";
-        __overlay__ {
-            serial0 = "/soc/serial@7e201000"; /* Dirección base de UART0 */
-            serial1 = "/soc/serial@7e215040"; /* Dirección base de UART1 (deshabilitada) */
-        };
-    };
+	fragment@2 {
+		target = <&bt>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	/* GPIO32/33 son los pines internos del Bluetooth, no los del header. */
+	fragment@3 {
+		target = <&uart0_pins>;
+		__overlay__ {
+			brcm,pins;
+			brcm,function;
+			brcm,pull;
+		};
+	};
+
+	fragment@4 {
+		target = <&bt_pins>;
+		__overlay__ {
+			brcm,pins;
+			brcm,function;
+			brcm,pull;
+		};
+	};
+
+	fragment@5 {
+		target-path = "/aliases";
+		__overlay__ {
+			serial0 = "/soc/serial@7e201000";
+			serial1 = "/soc/serial@7e215040";
+		};
+	};
 };
-
-fragment@4 {
-        target = <&uart0>;
-        __overlay__ {
-            esp32 {
-                compatible = "custom,esp32-link";
-                status = "okay";
-            };
-        };
-    };
-    

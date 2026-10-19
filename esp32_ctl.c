@@ -1,169 +1,200 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <sys/ioctl.h>
-#include <errno.h>
 
-#define DEVICE_NODE "/dev/esp32_link"
+#include "esp32_link.h"
+
 #define BUFFER_SIZE 256
 
-/* Debe coincidir exactamente con la macro definida en el kernel driver */
-#define ESP32_GET _IOR('E', 1, int)
+static void *monitor_thread(void *arg)
+{
+	const int fd = *(const int *)arg;
+	char rx_buffer[BUFFER_SIZE];
+	char line_buffer[BUFFER_SIZE];
+	size_t line_pos = 0;
+	bool discarding_line = false;
+	ssize_t bytes_read;
 
-/* 
- * Hilo Monitor: Se ejecuta en segundo plano.
- * Realiza un read() bloqueante. Gracias a la kfifo y wait_queue del driver, 
- * este hilo duerme sin consumir CPU hasta que llega telemetría por UART.
- */
-void *monitor_thread(void *arg) {
-    int fd = *(int *)arg;
-    char rx_buffer[BUFFER_SIZE];
-    char line_buffer[BUFFER_SIZE];
-    int line_pos = 0;
-    ssize_t bytes_read;
+	for (;;) {
+		bytes_read = read(fd, rx_buffer, sizeof(rx_buffer));
+		if (bytes_read < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("[Monitor] Error en read()");
+			break;
+		}
+		if (bytes_read == 0)
+			break;
 
-    while (1) {
-        bytes_read = read(fd, rx_buffer, sizeof(rx_buffer) - 1);
-        
-        if (bytes_read > 0) {
-            for (int i = 0; i < bytes_read; i++) {
-                char c = rx_buffer[i];
-                
-                /* Si llegó el final de la trama */
-                if (c == '\n') {
-                    line_buffer[line_pos] = '\0'; // Terminar la cadena en C
-                    
-                    /* Limpiar línea actual, imprimir respuesta limpia y restaurar prompt */
-                    printf("\r\033[K[ESP32] Telemetría: %s\n", line_buffer);
-                    printf("esp32-ctl> ");
-                    fflush(stdout);
-                    
-                    line_pos = 0; // Reiniciar buffer para la próxima trama
-                } 
-                /* Ignoramos el \r que rompe la terminal, guardamos el resto */
-                else if (c != '\r') {
-                    if (line_pos < BUFFER_SIZE - 1) {
-                        line_buffer[line_pos++] = c;
-                    }
-                }
-            }
-        } else if (bytes_read < 0) {
-            perror("\r\033[K[Monitor] Error en read()");
-            break;
-        }
-    }
-    return NULL;
+		for (ssize_t i = 0; i < bytes_read; i++) {
+			const char c = rx_buffer[i];
+
+			if (c == '\n') {
+				if (!discarding_line) {
+					line_buffer[line_pos] = '\0';
+					printf("\r\033[K[ESP32] %s\n", line_buffer);
+					printf("esp32-ctl> ");
+					fflush(stdout);
+				}
+				line_pos = 0;
+				discarding_line = false;
+			} else if (c != '\r' && !discarding_line) {
+				if (line_pos < sizeof(line_buffer) - 1) {
+					line_buffer[line_pos++] = c;
+				} else {
+					discarding_line = true;
+					line_pos = 0;
+				}
+			}
+		}
+	}
+
+	return NULL;
 }
 
-void print_help() {
-    printf("\n--- Consola de Control de Carga Electrónica ---\n");
-    printf("Comandos:\n");
-    printf("  set <modo> <valor>   : Configura modo (CC/CR) y setpoint (Ej: set CC 1.5)\n");
-    printf("  exec <kp> <ki> <kd>  : Actualiza parámetros del PID (Ej: exec 1.2 0.5 0.1)\n");
-    printf("  get                  : Consulta de estado síncrona (IOCTL)\n");
-    printf("  help                 : Muestra esta ayuda\n");
-    printf("  quit / exit          : Cierra el programa\n");
-    printf("-----------------------------------------------\n\n");
+static int send_bytes(int fd, const char *data, size_t length)
+{
+	size_t sent = 0;
+
+	while (sent < length) {
+		ssize_t result = write(fd, data + sent, length - sent);
+		if (result < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (result == 0) {
+			errno = EIO;
+			return -1;
+		}
+		sent += (size_t)result;
+	}
+
+	return 0;
 }
 
-int main(int argc, char *argv[]) {
-    int fd;
-    pthread_t tid;
-    char input[BUFFER_SIZE];
-    char cmd[32], arg1[32], arg2[32], arg3[32];
-    char tx_payload[BUFFER_SIZE];
+static int send_line(int fd, const char *line)
+{
+	char payload[BUFFER_SIZE];
+	int length = snprintf(payload, sizeof(payload), "%s\n", line);
 
-    /* 1. Abrir el dispositivo creado por el driver Serdev */
-    fd = open(DEVICE_NODE, O_RDWR);
-    if (fd < 0) {
-        fprintf(stderr, "Error al abrir %s: %s\n", DEVICE_NODE, strerror(errno));
-        fprintf(stderr, "Verifica que el driver esté cargado (lsmod) y los permisos.\n");
-        return EXIT_FAILURE;
-    }
+	if (length < 0 || (size_t)length >= sizeof(payload)) {
+		errno = EMSGSIZE;
+		return -1;
+	}
+	return send_bytes(fd, payload, (size_t)length);
+}
 
-    /* 2. Lanzar el hilo monitor para la lectura asíncrona */
-    if (pthread_create(&tid, NULL, monitor_thread, &fd) != 0) {
-        perror("Fallo al crear el hilo monitor");
-        close(fd);
-        return EXIT_FAILURE;
-    }
+static void print_help(void)
+{
+	puts("\n--- Consola de Control de Carga Electronica ---");
+	puts("Comandos:");
+	puts("  arm                  : habilita las protecciones");
+	puts("  stop                 : detiene la carga");
+	puts("  stream <0|1>          : desactiva/activa la telemetria JSON");
+	puts("  set <CC|CR> <val>    : cambia modo y setpoint");
+	puts("  exec <kp> <ki> <kd>  : envia parametros PID");
+	puts("  get                  : envia PING; la respuesta PONG aparece abajo");
+	puts("  help                 : muestra esta ayuda");
+	puts("  quit / exit          : cierra el programa");
+	puts("------------------------------------------------\n");
+}
 
-    print_help();
+int main(void)
+{
+	int fd;
+	pthread_t tid;
+	char input[BUFFER_SIZE];
+	char cmd[32] = {0};
+	char arg1[32] = {0};
+	char arg2[32] = {0};
+	char arg3[32] = {0};
+	char tx_payload[BUFFER_SIZE];
+	int parsed;
+	int ret;
 
-    /* 3. Bucle principal de la consola interactiva */
-    while (1) {
-        printf("esp32-ctl> ");
-        
-        if (fgets(input, sizeof(input), stdin) == NULL) {
-            break; /* EOF detectado (Ctrl+D) */
-        }
+	fd = open(ESP32_LINK_DEVICE_NODE, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Error al abrir %s: %s\n",
+			ESP32_LINK_DEVICE_NODE, strerror(errno));
+		fprintf(stderr, "Comprueba que el overlay y el modulo esp32_link esten cargados.\n");
+		return EXIT_FAILURE;
+	}
 
-        /* Limpiar salto de línea */
-        input[strcspn(input, "\n")] = 0;
+	ret = pthread_create(&tid, NULL, monitor_thread, &fd);
+	if (ret != 0) {
+		fprintf(stderr, "Fallo al crear el hilo monitor: %s\n", strerror(ret));
+		close(fd);
+		return EXIT_FAILURE;
+	}
 
-        if (strlen(input) == 0) continue;
+	print_help();
+	for (;;) {
+		printf("esp32-ctl> ");
+		fflush(stdout);
+		if (!fgets(input, sizeof(input), stdin))
+			break;
 
-        /* Parsear la entrada */
-        int parsed = sscanf(input, "%31s %31s %31s %31s", cmd, arg1, arg2, arg3);
+		input[strcspn(input, "\r\n")] = '\0';
+		if (input[0] == '\0')
+			continue;
 
-        if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
-            break;
-        } 
-        else if (strcmp(cmd, "help") == 0) {
-            print_help();
-        }
-        else if (strcmp(cmd, "arm") == 0) {
-            write(fd, "ARM\n", 4);
-        }
-        else if (strcmp(cmd, "stop") == 0) {
-            write(fd, "STOP\n", 5);
-        }
-        else if (strcmp(cmd, "stream") == 0) {
-            if (parsed >= 2) {
-                snprintf(tx_payload, sizeof(tx_payload), "STREAM %s\n", arg1);
-                write(fd, tx_payload, strlen(tx_payload));
-            }
-        }
-        else if (strcmp(cmd, "set") == 0) {
-            if (parsed >= 3) {
-                /* Envía primero el modo, y luego el setpoint */
-                snprintf(tx_payload, sizeof(tx_payload), "MODE %s\n", arg1);
-                write(fd, tx_payload, strlen(tx_payload));
-                
-                usleep(10000); // Pequeña pausa de 10ms entre comandos
-                
-                snprintf(tx_payload, sizeof(tx_payload), "SETPOINT %s\n", arg2);
-                write(fd, tx_payload, strlen(tx_payload));
-            } else {
-                printf("Error: Uso: set <modo> <valor> (Ej: set CC 1.5)\n");
-            }
-        }
-        else if (strcmp(cmd, "exec") == 0) {
-            if (parsed >= 4) {
-                snprintf(tx_payload, sizeof(tx_payload), "PID %s %s %s\n", arg1, arg2, arg3);
-                write(fd, tx_payload, strlen(tx_payload));
-            } else {
-                printf("Error: Uso: exec <kp> <ki> <kd>\n");
-            }
-        }
-        else if (strcmp(cmd, "get") == 0) {
-            /* Eliminamos el ioctl y enviamos PING directamente como texto */
-            printf("[TX] Enviando PING directo a la UART...\n");
-            write(fd, "PING\n", 5);
-        }
-        else {
-            printf("Comando desconocido: '%s'. Escribe 'help'.\n", cmd);
-        }
-    }
+		cmd[0] = arg1[0] = arg2[0] = arg3[0] = '\0';
+		parsed = sscanf(input, "%31s %31s %31s %31s",
+				cmd, arg1, arg2, arg3);
+		if (parsed < 1)
+			continue;
 
-    /* Limpieza y cierre ordenado */
-    printf("\nCerrando programa...\n");
-    pthread_cancel(tid);      // Forzar la salida del hilo monitor (bloqueado en read)
-    pthread_join(tid, NULL);  // Esperar a que el hilo muera
-    close(fd);
-    
-    return EXIT_SUCCESS;
+		if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
+			break;
+		} else if (strcmp(cmd, "help") == 0) {
+			print_help();
+			continue;
+		} else if (strcmp(cmd, "arm") == 0) {
+			ret = send_line(fd, "ARM");
+		} else if (strcmp(cmd, "stop") == 0) {
+			ret = send_line(fd, "STOP");
+		} else if (strcmp(cmd, "stream") == 0 && parsed >= 2 &&
+			   (strcmp(arg1, "0") == 0 || strcmp(arg1, "1") == 0)) {
+			snprintf(tx_payload, sizeof(tx_payload), "STREAM %s", arg1);
+			ret = send_line(fd, tx_payload);
+		} else if (strcmp(cmd, "set") == 0 && parsed >= 3 &&
+			   (strcmp(arg1, "CC") == 0 || strcmp(arg1, "CR") == 0)) {
+			snprintf(tx_payload, sizeof(tx_payload), "MODE %s", arg1);
+			ret = send_line(fd, tx_payload);
+			if (ret == 0) {
+				const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+				nanosleep(&pause, NULL);
+				snprintf(tx_payload, sizeof(tx_payload), "SETPOINT %s", arg2);
+				ret = send_line(fd, tx_payload);
+			}
+		} else if (strcmp(cmd, "exec") == 0 && parsed >= 4) {
+			snprintf(tx_payload, sizeof(tx_payload), "PID %s %s %s",
+				 arg1, arg2, arg3);
+			ret = send_line(fd, tx_payload);
+		} else if (strcmp(cmd, "get") == 0) {
+			ret = send_line(fd, "PING");
+		} else {
+			printf("Uso incorrecto o comando desconocido: '%s'. Escribe 'help'.\n", cmd);
+			continue;
+		}
+
+		if (ret < 0)
+			fprintf(stderr, "Error enviando comando: %s\n", strerror(errno));
+	}
+
+	puts("\nCerrando programa...");
+	pthread_cancel(tid);
+	pthread_join(tid, NULL);
+	close(fd);
+	return EXIT_SUCCESS;
 }

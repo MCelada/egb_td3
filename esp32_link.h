@@ -1,17 +1,11 @@
-#ifndef _ESP32_LINK_H_
-#define _ESP32_LINK_H_
+#ifndef ESP32_LINK_H
+#define ESP32_LINK_H
 
-#include <linux/ioctl.h>
+#define ESP32_LINK_DRIVER_NAME "esp32_link"
+#define ESP32_LINK_COMPATIBLE "custom,esp32-link"
+#define ESP32_LINK_DEVICE_NODE "/dev/esp32_link"
+#define ESP32_LINK_DEFAULT_BAUD 115200
+#define ESP32_LINK_FIFO_SIZE 4096
+#define ESP32_LINK_WRITE_TIMEOUT_MS 1000
 
-#define ESP32_VAR_NAME_MAX 16
-
-struct esp32_var{
-    char nombre[ESP32_VAR_NAME_MAX];
-    int valor;
-}
-
-#define ESP32_MAGIC 'y'
-#define ESP32_SET _IOW(ESP32_MAGIC, 1, struct esp32_var)
-#define ESP32_GET _IOR(ESP32_MAGIC, 2, struct esp32_var)
-
-#endif
+#endif /* ESP32_LINK_H */
