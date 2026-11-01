@@ -1,0 +1,5 @@
+Comandos
+
+cd ~/egb/egb_td3
+. .venv/bin/activate
+streamlit run webpage.py --server.address 0.0.0.0 --server.port 8501

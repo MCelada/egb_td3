@@ -90,6 +90,40 @@ def send_command(command):
     return True
 
 
+def send_command_and_wait(command, expected_response, timeout_s=2.0):
+    """Envía un comando y espera el ACK correspondiente de la ESP32.
+
+    Mientras llega la respuesta, conserva la telemetría recibida en el historial.
+    """
+    if not send_command(command):
+        return False, "No hay una conexión UART abierta."
+
+    deadline = time.monotonic() + timeout_s
+    rx_queue = st.session_state.rx_queue
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            message = rx_queue.get(timeout=min(0.1, max(remaining, 0.0)))
+        except queue.Empty:
+            continue
+
+        message_type = message.get("type")
+        if message_type == "telemetry":
+            update_telemetry(message)
+        elif message_type == "response":
+            response = message.get("text", "")
+            st.session_state.last_response = response
+            if response == expected_response:
+                return True, response
+            if response.startswith("ERR"):
+                return False, response
+        elif message_type == "error":
+            st.session_state.last_response = message.get("text", "")
+            return False, st.session_state.last_response
+
+    return False, f"Sin respuesta {expected_response} de la ESP32 (tiempo agotado)."
+
+
 def disconnect():
     stop_event = st.session_state.stop_event
     if stop_event is not None:
@@ -226,7 +260,18 @@ with col_ctrl:
     modo = st.radio("Modo a enviar", ["Corriente constante (CC)", "Resistencia constante (CR)"])
     modo_str = "CC" if "Corriente" in modo else "CR"
     unidad = "A" if modo_str == "CC" else "Ω"
-    setpoint = st.number_input(f"Consigna a enviar ({unidad})", min_value=0.0, max_value=20.0, step=0.1)
+    minimum = 0.0 if modo_str == "CC" else 1.0
+    with st.form("control_carga"):
+        setpoint = st.number_input(
+            f"Consigna a enviar ({unidad})",
+            min_value=minimum,
+            max_value=20.0,
+            value=minimum,
+            step=0.1,
+            format="%.3f" if modo_str == "CC" else "%.1f",
+            key=f"setpoint_{modo_str.lower()}",
+        )
+        iniciar = st.form_submit_button("Iniciar carga", type="primary", use_container_width=True)
 
     if modo_str == "CR" and setpoint > 0.0:
         estimated_current = st.session_state.current_data["v"] / setpoint
@@ -239,11 +284,32 @@ with col_ctrl:
                 "circuito antes de enviar esta consigna."
             )
 
-    if st.button("Aplicar modo y consigna"):
-        if send_command(f"MODE {modo_str}") and send_command(f"SETPOINT {setpoint:.6g}"):
-            st.toast(f"Comando enviado: {modo_str} @ {setpoint:.6g} {unidad}")
+    if iniciar:
+        if modo_str == "CR" and setpoint < 1.0:
+            st.error("En modo CR la resistencia debe ser de al menos 1 Ω.")
         else:
-            st.error("No se pudo enviar el comando. Comprueba la conexión UART.")
+            mode_ok, mode_result = send_command_and_wait(f"MODE {modo_str}", "OK MODE")
+            if not mode_ok:
+                st.error(f"La ESP32 no confirmó el modo {modo_str}: {mode_result}")
+            else:
+                setpoint_ok, setpoint_result = send_command_and_wait(
+                    f"SETPOINT {setpoint:.6g}", "OK SETPOINT"
+                )
+                if not setpoint_ok:
+                    st.error(f"La ESP32 no confirmó la consigna: {setpoint_result}")
+                else:
+                    arm_ok, arm_result = send_command_and_wait("ARM", "OK ARM")
+                    if arm_ok:
+                        st.success(f"Carga iniciada: {modo_str} @ {setpoint:.6g} {unidad}")
+                    else:
+                        st.error(f"Modo y consigna enviados, pero no se confirmó el inicio: {arm_result}")
+
+    if st.button("Detener carga", use_container_width=True):
+        stop_ok, stop_result = send_command_and_wait("STOP", "OK STOP")
+        if stop_ok:
+            st.success("Carga detenida")
+        else:
+            st.error(f"No se confirmó la parada: {stop_result}")
 
 with col_lim:
     st.subheader("Límites de protección")
@@ -252,25 +318,38 @@ with col_lim:
         f"Máx V: **{limits['v_max_cfg']:.2f} V** | "
         f"Máx I: **{limits['i_max_cfg']:.2f} A**"
     )
-    st.caption("El firmware solo aplica OVP/OCP después de recibir ARM; el dashboard todavía no envía ese comando.")
+    st.caption("Configura el modo y la consigna, y luego pulsa «Iniciar carga». La carga no cambia mientras editas el formulario.")
     with st.expander("Modificar límites"):
         new_v_max = st.number_input("Nuevo voltaje máximo (V)", min_value=1.0, max_value=50.0, value=limits["v_max_cfg"])
         new_i_max = st.number_input("Nueva corriente máxima (A)", min_value=0.1, max_value=15.0, value=limits["i_max_cfg"])
         if st.button("Aplicar límites de seguridad"):
-            voltage_sent = send_command(f"OVP {new_v_max:.6g}")
-            current_sent = send_command(f"OCP {new_i_max:.6g}")
+            voltage_sent, voltage_result = send_command_and_wait(
+                f"OVP {new_v_max:.6g}", "OK OVP"
+            )
+            current_sent, current_result = (False, "No enviado")
+            if voltage_sent:
+                current_sent, current_result = send_command_and_wait(
+                    f"OCP {new_i_max:.6g}", "OK OCP"
+                )
             if voltage_sent and current_sent:
                 st.session_state.current_data["v_max_cfg"] = new_v_max
                 st.session_state.current_data["i_max_cfg"] = new_i_max
-                st.toast("Límites enviados")
+                st.success("Límites confirmados por la ESP32")
+            elif not voltage_sent:
+                st.error(f"La ESP32 no confirmó OVP: {voltage_result}")
             else:
-                st.error("No se pudieron enviar los límites. Comprueba la conexión UART.")
+                st.error(f"La ESP32 no confirmó OCP: {current_result}")
 
 st.divider()
 st.subheader("Monitoreo del PID")
 if st.session_state.history:
     chart = pd.DataFrame(st.session_state.history).set_index("Tiempo")
-    st.line_chart(chart[["Objetivo (A)", "Medido", "Salida DAC"]])
+    st.markdown("**Corriente objetivo (A)**")
+    st.line_chart(chart[["Objetivo (A)"]])
+    st.markdown("**Corriente medida (A)**")
+    st.line_chart(chart[["Medido"]])
+    st.markdown("**Salida del DAC (cuentas, 0–4095)**")
+    st.line_chart(chart[["Salida DAC"]])
 else:
     st.caption("Esperando telemetría JSON de la UART...")
 
