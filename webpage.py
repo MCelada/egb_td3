@@ -28,8 +28,14 @@ if "link_fd" not in st.session_state:
         "adc_current_mv": None,
         "medido": 0.0,
         "pwm": 0.0,
-        "v_max_cfg": 15.0,
-        "i_max_cfg": 0.5,
+        "v_max_cfg": None,
+        "i_max_cfg": None,
+        "load_enabled": None,
+        "alarm_active": None,
+        "alarm_ovp": None,
+        "alarm_ocp": None,
+        "start_blocked": None,
+        "timestamp_us": 0,
     }
     st.session_state.history = deque(maxlen=60)
     st.session_state.last_response = ""
@@ -124,6 +130,77 @@ def send_command_and_wait(command, expected_response, timeout_s=2.0):
     return False, f"Sin respuesta {expected_response} de la ESP32 (tiempo agotado)."
 
 
+def wait_for_load_status(mode, setpoint, after_timestamp_us, timeout_s=2.0):
+    """Espera telemetría posterior al START que confirme el estado real del PID."""
+    deadline = time.monotonic() + timeout_s
+    rx_queue = st.session_state.rx_queue
+    candidate_status = None
+    candidate_since = None
+    while time.monotonic() < deadline:
+        current = st.session_state.current_data
+        same_config = (
+            current.get("mode") == mode
+            and current.get("configured_setpoint") is not None
+            and abs(float(current["configured_setpoint"]) - setpoint) < 0.0005
+        )
+        if current.get("timestamp_us", 0) > after_timestamp_us and same_config:
+            if current.get("load_enabled") is None:
+                status = "legacy"
+            elif current.get("alarm_active"):
+                status = "alarm"
+            elif current.get("start_blocked"):
+                status = "blocked"
+            elif current.get("load_enabled"):
+                return "running"
+            else:
+                status = "stopped"
+            # El ACK UART llega antes de que SysMan actualice PID/telemetría.
+            # Esperamos una transición estable para no confundir una muestra vieja.
+            if status != candidate_status:
+                candidate_status = status
+                candidate_since = time.monotonic()
+            elif time.monotonic() - candidate_since >= 0.25:
+                return status
+        else:
+            candidate_status = None
+            candidate_since = None
+
+        try:
+            message = rx_queue.get(timeout=min(0.1, max(deadline - time.monotonic(), 0.0)))
+        except queue.Empty:
+            continue
+        if message.get("type") == "telemetry":
+            update_telemetry(message)
+        elif message.get("type") == "error":
+            st.session_state.last_response = message.get("text", "")
+            return "link_error"
+    return "timeout"
+
+
+def wait_for_limit_readback(ovp_v, ocp_a, after_timestamp_us, timeout_s=2.0):
+    """Espera que la telemetría confirme los umbrales aplicados en el firmware."""
+    deadline = time.monotonic() + timeout_s
+    rx_queue = st.session_state.rx_queue
+    while time.monotonic() < deadline:
+        current = st.session_state.current_data
+        if current.get("timestamp_us", 0) > after_timestamp_us:
+            actual_ovp = current.get("v_max_cfg")
+            actual_ocp = current.get("i_max_cfg")
+            if actual_ovp is not None and actual_ocp is not None:
+                if abs(actual_ovp - ovp_v) < 0.01 and abs(actual_ocp - ocp_a) < 0.001:
+                    return True
+        try:
+            message = rx_queue.get(timeout=min(0.1, max(deadline - time.monotonic(), 0.0)))
+        except queue.Empty:
+            continue
+        if message.get("type") == "telemetry":
+            update_telemetry(message)
+        elif message.get("type") == "error":
+            st.session_state.last_response = message.get("text", "")
+            return False
+    return False
+
+
 def disconnect():
     stop_event = st.session_state.stop_event
     if stop_event is not None:
@@ -161,6 +238,14 @@ def update_telemetry(data):
             "adc_current_mv": float(adc_current_mv) if adc_current_mv is not None else None,
             "medido": current,
             "pwm": dac_output,
+            "timestamp_us": int(data.get("timestamp_us", 0)),
+            "load_enabled": bool(data["load_enabled"]) if "load_enabled" in data else None,
+            "alarm_active": bool(data["alarm_active"]) if "alarm_active" in data else None,
+            "alarm_ovp": bool(data["alarm_ovp"]) if "alarm_ovp" in data else None,
+            "alarm_ocp": bool(data["alarm_ocp"]) if "alarm_ocp" in data else None,
+            "start_blocked": bool(data["start_blocked"]) if "start_blocked" in data else None,
+            "v_max_cfg": float(data["limit_ovp_v"]) if "limit_ovp_v" in data else None,
+            "i_max_cfg": float(data["limit_ocp_a"]) if "limit_ocp_a" in data else None,
         }
     )
     st.session_state.history.append(
@@ -241,6 +326,26 @@ if active_mode in ("CC", "CR"):
 else:
     st.caption("Esperando que la ESP32 envíe modo y consigna activos por UART.")
 
+load_enabled = st.session_state.current_data.get("load_enabled")
+alarm_active = st.session_state.current_data.get("alarm_active")
+start_blocked = st.session_state.current_data.get("start_blocked")
+if alarm_active:
+    alarm_reasons = []
+    if st.session_state.current_data.get("alarm_ovp"):
+        alarm_reasons.append("OVP: tensión sobre el límite")
+    if st.session_state.current_data.get("alarm_ocp"):
+        alarm_reasons.append("OCP: corriente sobre el límite")
+    reason_text = " y ".join(alarm_reasons) if alarm_reasons else "protección activa"
+    st.error(f"{reason_text}. La ESP32 detuvo la carga; revisá mediciones y límites antes de rearmar.")
+elif start_blocked:
+    st.error("Inicio bloqueado: la consigna calculada supera el límite OCP o la medición supera OVP/OCP.")
+elif load_enabled is True:
+    st.success("Carga habilitada según telemetría de la ESP32.")
+elif load_enabled is False:
+    st.warning("Carga detenida según telemetría de la ESP32.")
+elif st.session_state.current_data.get("mode") is not None:
+    st.warning("El firmware no informa el estado de carga ni los límites reales. Actualizá y flasheá el firmware EGA.")
+
 st.divider()
 col_ctrl, col_lim = st.columns(2)
 
@@ -260,12 +365,13 @@ with col_ctrl:
     modo = st.radio("Modo a enviar", ["Corriente constante (CC)", "Resistencia constante (CR)"])
     modo_str = "CC" if "Corriente" in modo else "CR"
     unidad = "A" if modo_str == "CC" else "Ω"
-    minimum = 0.0 if modo_str == "CC" else 1.0
+    minimum = 0.01 if modo_str == "CC" else 1.0
+    maximum = 5.0 if modo_str == "CC" else 20.0
     with st.form("control_carga"):
         setpoint = st.number_input(
             f"Consigna a enviar ({unidad})",
             min_value=minimum,
-            max_value=20.0,
+            max_value=maximum,
             value=minimum,
             step=0.1,
             format="%.3f" if modo_str == "CC" else "%.1f",
@@ -283,26 +389,45 @@ with col_ctrl:
                 "calibración de corriente hasta 0.20 A; verifica el límite real del "
                 "circuito antes de enviar esta consigna."
             )
+    else:
+        estimated_current = setpoint if modo_str == "CC" else 0.0
+
+    active_ocp = st.session_state.current_data.get("i_max_cfg")
+    if active_ocp is not None and estimated_current > active_ocp:
+        st.warning(
+            f"La consigna equivale a {estimated_current:.3f} A y supera el OCP activo "
+            f"({active_ocp:.3f} A); el firmware rechazará el inicio."
+        )
 
     if iniciar:
         if modo_str == "CR" and setpoint < 1.0:
             st.error("En modo CR la resistencia debe ser de al menos 1 Ω.")
         else:
-            mode_ok, mode_result = send_command_and_wait(f"MODE {modo_str}", "OK MODE")
-            if not mode_ok:
-                st.error(f"La ESP32 no confirmó el modo {modo_str}: {mode_result}")
-            else:
-                setpoint_ok, setpoint_result = send_command_and_wait(
-                    f"SETPOINT {setpoint:.6g}", "OK SETPOINT"
+            timestamp_before_start = st.session_state.current_data.get("timestamp_us", 0)
+            start_ok, start_result = send_command_and_wait(
+                f"START {modo_str} {setpoint:.6g}", "OK START"
+            )
+            if not start_ok:
+                st.error(
+                    f"La ESP32 no aceptó el inicio ({start_result}). "
+                    "Probablemente falta flashear el firmware EGA actualizado."
                 )
-                if not setpoint_ok:
-                    st.error(f"La ESP32 no confirmó la consigna: {setpoint_result}")
+            else:
+                status = wait_for_load_status(
+                    modo_str, setpoint, timestamp_before_start
+                )
+                if status == "running":
+                    st.success(f"Carga iniciada: {modo_str} @ {setpoint:.6g} {unidad}")
+                elif status == "alarm":
+                    st.error("Inicio bloqueado por OVP/OCP; revisá el indicador de protección y los límites.")
+                elif status == "blocked":
+                    st.error("La ESP32 rechazó el inicio porque la consigna excede OCP o hay una medición fuera de límite.")
+                elif status == "legacy":
+                    st.error("La ESP32 aceptó START pero el firmware no reporta estado. Flasheá la versión EGA actualizada.")
+                elif status == "stopped":
+                    st.error("La ESP32 recibió START, pero la telemetría sigue indicando la carga detenida.")
                 else:
-                    arm_ok, arm_result = send_command_and_wait("ARM", "OK ARM")
-                    if arm_ok:
-                        st.success(f"Carga iniciada: {modo_str} @ {setpoint:.6g} {unidad}")
-                    else:
-                        st.error(f"Modo y consigna enviados, pero no se confirmó el inicio: {arm_result}")
+                    st.error("La ESP32 aceptó START, pero no llegó telemetría nueva para verificar si arrancó.")
 
     if st.button("Detener carga", use_container_width=True):
         stop_ok, stop_result = send_command_and_wait("STOP", "OK STOP")
@@ -314,15 +439,22 @@ with col_ctrl:
 with col_lim:
     st.subheader("Límites de protección")
     limits = st.session_state.current_data
-    st.info(
-        f"Máx V: **{limits['v_max_cfg']:.2f} V** | "
-        f"Máx I: **{limits['i_max_cfg']:.2f} A**"
-    )
-    st.caption("Configura el modo y la consigna, y luego pulsa «Iniciar carga». La carga no cambia mientras editas el formulario.")
+    actual_ovp = limits.get("v_max_cfg")
+    actual_ocp = limits.get("i_max_cfg")
+    if actual_ovp is None or actual_ocp is None:
+        st.warning("Esperando lectura de OVP/OCP desde la ESP32; los valores no están confirmados aún.")
+        actual_ovp = 15.0 if actual_ovp is None else actual_ovp
+        actual_ocp = 0.5 if actual_ocp is None else actual_ocp
+    else:
+        st.info(f"Límites activos informados por ESP32: **OVP {actual_ovp:.2f} V** · **OCP {actual_ocp:.3f} A**")
+    st.caption("El firmware conserva los límites en RAM: vuelven a los valores iniciales al reiniciar la ESP32.")
     with st.expander("Modificar límites"):
-        new_v_max = st.number_input("Nuevo voltaje máximo (V)", min_value=1.0, max_value=50.0, value=limits["v_max_cfg"])
-        new_i_max = st.number_input("Nueva corriente máxima (A)", min_value=0.1, max_value=15.0, value=limits["i_max_cfg"])
+        new_v_max = st.number_input("Nuevo límite OVP (V)", min_value=1.0, max_value=30.0, value=float(actual_ovp), step=0.5)
+        new_i_max = st.number_input("Nuevo límite OCP (A)", min_value=0.01, max_value=5.0, value=float(actual_ocp), step=0.01, format="%.3f")
+        if new_i_max > 0.20:
+            st.warning("La calibración de corriente disponible se comprobó hasta aproximadamente 0.20 A; por encima de ese valor el umbral OCP no está verificado con tus mediciones.")
         if st.button("Aplicar límites de seguridad"):
+            limits_timestamp = st.session_state.current_data.get("timestamp_us", 0)
             voltage_sent, voltage_result = send_command_and_wait(
                 f"OVP {new_v_max:.6g}", "OK OVP"
             )
@@ -332,9 +464,10 @@ with col_lim:
                     f"OCP {new_i_max:.6g}", "OK OCP"
                 )
             if voltage_sent and current_sent:
-                st.session_state.current_data["v_max_cfg"] = new_v_max
-                st.session_state.current_data["i_max_cfg"] = new_i_max
-                st.success("Límites confirmados por la ESP32")
+                if wait_for_limit_readback(new_v_max, new_i_max, limits_timestamp):
+                    st.success("OVP y OCP aplicados; la telemetría confirma los valores activos.")
+                else:
+                    st.warning("UART aceptó los comandos, pero la telemetría no confirmó los nuevos valores. No los tomes como límites activos.")
             elif not voltage_sent:
                 st.error(f"La ESP32 no confirmó OVP: {voltage_result}")
             else:
