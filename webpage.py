@@ -127,7 +127,10 @@ def send_command_and_wait(command, expected_response, timeout_s=2.0):
             st.session_state.last_response = message.get("text", "")
             return False, st.session_state.last_response
 
-    return False, f"Sin respuesta {expected_response} de la ESP32 (tiempo agotado)."
+    return False, (
+        f"Sin respuesta {expected_response} de la ESP32 (tiempo agotado). "
+        "Verificá que no haya otro lector del UART y la línea TX de la Raspberry hacia RX de la ESP32."
+    )
 
 
 def wait_for_load_status(mode, setpoint, after_timestamp_us, timeout_s=2.0):
@@ -409,8 +412,8 @@ with col_ctrl:
             )
             if not start_ok:
                 st.error(
-                    f"La ESP32 no aceptó el inicio ({start_result}). "
-                    "Probablemente falta flashear el firmware EGA actualizado."
+                    f"La ESP32 no confirmó el inicio ({start_result}). "
+                    "Comprobá el lector UART único, el cable TX/RX y que el firmware EGA esté actualizado."
                 )
             else:
                 status = wait_for_load_status(
@@ -423,7 +426,7 @@ with col_ctrl:
                 elif status == "blocked":
                     st.error("La ESP32 rechazó el inicio porque la consigna excede OCP o hay una medición fuera de límite.")
                 elif status == "legacy":
-                    st.error("La ESP32 aceptó START pero el firmware no reporta estado. Flasheá la versión EGA actualizada.")
+                    st.error("La ESP32 aceptó START pero el firmware no reporta el estado. Flasheá la versión EGA actualizada.")
                 elif status == "stopped":
                     st.error("La ESP32 recibió START, pero la telemetría sigue indicando la carga detenida.")
                 else:
