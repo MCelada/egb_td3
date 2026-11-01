@@ -136,6 +136,27 @@ def send_command_and_wait(command, expected_response, timeout_s=2.0):
     )
 
 
+def send_start_with_legacy_fallback(mode, setpoint):
+    """Usa START atómico y cae al protocolo anterior solo si no existe START."""
+    started, response = send_command_and_wait(
+        f"START {mode} {setpoint:.6g}", "OK START"
+    )
+    if started or response != "ERR COMMAND":
+        return started, response
+
+    # Firmware anterior: primero configura modo y consigna; ARM habilita el lazo.
+    legacy_steps = (
+        (f"MODE {mode}", "OK MODE"),
+        (f"SETPOINT {setpoint:.6g}", "OK SETPOINT"),
+        ("ARM", "OK ARM"),
+    )
+    for command, expected in legacy_steps:
+        ok, result = send_command_and_wait(command, expected)
+        if not ok:
+            return False, f"START no soportado; falló {command}: {result}"
+    return True, "OK ARM (protocolo compatible)"
+
+
 def wait_for_load_status(mode, setpoint, after_received_at, timeout_s=2.0):
     """Espera telemetría posterior al START que confirme el estado real del PID."""
     deadline = time.monotonic() + timeout_s
@@ -462,8 +483,8 @@ with col_ctrl:
             st.error("En modo CR la resistencia debe ser de al menos 1 Ω.")
         else:
             telemetry_before_start = st.session_state.current_data.get("telemetry_received_at", 0.0)
-            start_ok, start_result = send_command_and_wait(
-                f"START {modo_str} {setpoint:.6g}", "OK START"
+            start_ok, start_result = send_start_with_legacy_fallback(
+                modo_str, setpoint
             )
             if not start_ok:
                 st.error(
