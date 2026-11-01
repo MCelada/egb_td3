@@ -440,7 +440,9 @@ with col_ctrl:
     modo_str = "CC" if "Corriente" in modo else "CR"
     unidad = "A" if modo_str == "CC" else "Ω"
     minimum = 0.01 if modo_str == "CC" else 1.0
-    maximum = 5.0 if modo_str == "CC" else 20.0
+    # CR is an impedance setpoint; the firmware/TFT accept up to 10 kΩ.
+    # The active OCP check below still prevents a V/R request above the limit.
+    maximum = 5.0 if modo_str == "CC" else 10000.0
     with st.form("control_carga"):
         setpoint = st.number_input(
             f"Consigna a enviar ({unidad})",
