@@ -72,7 +72,12 @@ def serial_reader(fd, rx_queue, stop_event):
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError:
-                    message = {"type": "response", "text": line}
+                    # Solo mostramos respuestas ASCII del protocolo. Ignora
+                    # fragmentos o bytes corruptos para no contaminar la UI.
+                    if line == "READY carga_electronica" or line == "PONG" or line.startswith(("OK ", "ERR ")):
+                        message = {"type": "response", "text": line}
+                    else:
+                        continue
                 try:
                     rx_queue.put_nowait(message)
                 except queue.Full:

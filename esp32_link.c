@@ -23,8 +23,10 @@ struct esp32_link_dev {
 	dev_t devt;
 	DECLARE_KFIFO(rx_fifo, unsigned char, ESP32_LINK_FIFO_SIZE);
 	wait_queue_head_t read_wait;
+	struct mutex open_lock;
 	struct mutex tx_lock;
 	bool online;
+	bool opened;
 };
 
 static struct class *esp32_class;
@@ -138,16 +140,37 @@ static int esp32_link_open(struct inode *inode, struct file *file)
 {
 	struct esp32_link_dev *priv = container_of(inode->i_cdev,
 							  struct esp32_link_dev, cdev);
+	int ret = 0;
 
-	if (!READ_ONCE(priv->online))
-		return -ENODEV;
-	file->private_data = priv;
+	mutex_lock(&priv->open_lock);
+	if (!READ_ONCE(priv->online)) {
+		ret = -ENODEV;
+	} else if (priv->opened) {
+		ret = -EBUSY;
+	} else {
+		priv->opened = true;
+		file->private_data = priv;
+	}
+	mutex_unlock(&priv->open_lock);
+
+	return ret;
+}
+
+static int esp32_link_release(struct inode *inode, struct file *file)
+{
+	struct esp32_link_dev *priv = file->private_data;
+
+	mutex_lock(&priv->open_lock);
+	priv->opened = false;
+	mutex_unlock(&priv->open_lock);
+
 	return 0;
 }
 
 static const struct file_operations esp32_link_fops = {
 	.owner = THIS_MODULE,
 	.open = esp32_link_open,
+	.release = esp32_link_release,
 	.read = esp32_link_read,
 	.write = esp32_link_write,
 	.poll = esp32_link_poll,
@@ -171,7 +194,9 @@ static int esp32_link_probe(struct serdev_device *serdev)
 	priv->online = true;
 	INIT_KFIFO(priv->rx_fifo);
 	init_waitqueue_head(&priv->read_wait);
+	mutex_init(&priv->open_lock);
 	mutex_init(&priv->tx_lock);
+	priv->opened = false;
 	serdev_device_set_drvdata(serdev, priv);
 	serdev_device_set_client_ops(serdev, &esp32_link_serdev_ops);
 
