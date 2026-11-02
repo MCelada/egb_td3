@@ -1,4 +1,5 @@
 import json
+import fcntl
 import os
 import queue
 import select
@@ -12,8 +13,11 @@ import streamlit as st
 
 st.set_page_config(page_title="Control de Carga Electrónica", layout="wide")
 
+UART_LOCK_PATH = "/tmp/esp32_link.lock"
+
 if "link_fd" not in st.session_state:
     st.session_state.link_fd = None
+    st.session_state.uart_lock_fd = None
     st.session_state.reader_thread = None
     st.session_state.stop_event = None
     st.session_state.rx_queue = queue.Queue(maxsize=512)
@@ -42,6 +46,9 @@ if "link_fd" not in st.session_state:
     }
     st.session_state.history = deque(maxlen=60)
     st.session_state.last_response = ""
+
+if "uart_lock_fd" not in st.session_state:
+    st.session_state.uart_lock_fd = None
 
 
 def serial_reader(fd, rx_queue, stop_event):
@@ -244,6 +251,17 @@ def disconnect():
         thread.join(timeout=0.5)
     st.session_state.reader_thread = None
     st.session_state.stop_event = None
+    lock_fd = st.session_state.uart_lock_fd
+    st.session_state.uart_lock_fd = None
+    if lock_fd is not None:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
 
 
 def update_telemetry(data):
@@ -308,7 +326,14 @@ st.sidebar.caption("UART configurada a 115200, 8N1 por el driver del kernel.")
 
 if st.sidebar.button("Conectar / Desconectar"):
     if st.session_state.link_fd is None:
+        lock_fd = None
+        fd = None
+        lock_acquired = False
         try:
+            # Solo una sesión/proceso puede leer y escribir el UART a la vez.
+            lock_fd = os.open(UART_LOCK_PATH, os.O_CREAT | os.O_RDONLY, 0o666)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_acquired = True
             fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
             stop_event = threading.Event()
             rx_queue = queue.Queue(maxsize=512)
@@ -318,6 +343,7 @@ if st.sidebar.button("Conectar / Desconectar"):
                 daemon=True,
             )
             st.session_state.link_fd = fd
+            st.session_state.uart_lock_fd = lock_fd
             st.session_state.stop_event = stop_event
             st.session_state.rx_queue = rx_queue
             st.session_state.reader_thread = reader_thread
@@ -348,7 +374,29 @@ if st.sidebar.button("Conectar / Desconectar"):
             st.session_state.last_response = ""
             reader_thread.start()
             st.sidebar.success("Conectado al ESP32")
+        except BlockingIOError as error:
+            if fd is not None:
+                os.close(fd)
+            if lock_fd is not None:
+                if lock_acquired:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            if lock_acquired:
+                st.sidebar.error(f"UART no disponible en {port}: {error}")
+            else:
+                st.sidebar.error(
+                    "UART ocupado por otra pestaña, esp32-ctl u otro proceso. "
+                    "Desconectá esa sesión antes de conectar esta."
+                )
         except OSError as error:
+            if fd is not None:
+                os.close(fd)
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(lock_fd)
             st.sidebar.error(f"Error abriendo {port}: {error}")
     else:
         disconnect()

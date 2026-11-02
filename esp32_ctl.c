@@ -1,3 +1,4 @@
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
@@ -10,10 +11,12 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/file.h>
 
 #include "esp32_link.h"
 
 #define BUFFER_SIZE 256
+#define UART_LOCK_PATH "/tmp/esp32_link.lock"
 
 static void *monitor_thread(void *arg)
 {
@@ -112,6 +115,7 @@ static void print_help(void)
 int main(void)
 {
 	int fd;
+	int lock_fd;
 	pthread_t tid;
 	char input[BUFFER_SIZE];
 	char cmd[32] = {0};
@@ -122,11 +126,25 @@ int main(void)
 	int parsed;
 	int ret;
 
+	lock_fd = open(UART_LOCK_PATH, O_CREAT | O_RDONLY, 0666);
+	if (lock_fd < 0) {
+		fprintf(stderr, "No se pudo abrir el bloqueo UART %s: %s\n",
+			UART_LOCK_PATH, strerror(errno));
+		return EXIT_FAILURE;
+	}
+	if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+		fprintf(stderr, "UART ocupado por Streamlit u otra sesion; desconectala antes de usar esp32-ctl.\n");
+		close(lock_fd);
+		return EXIT_FAILURE;
+	}
+
 	fd = open(ESP32_LINK_DEVICE_NODE, O_RDWR);
 	if (fd < 0) {
 		fprintf(stderr, "Error al abrir %s: %s\n",
 			ESP32_LINK_DEVICE_NODE, strerror(errno));
 		fprintf(stderr, "Comprueba que el overlay y el modulo esp32_link esten cargados.\n");
+		flock(lock_fd, LOCK_UN);
+		close(lock_fd);
 		return EXIT_FAILURE;
 	}
 
@@ -134,6 +152,8 @@ int main(void)
 	if (ret != 0) {
 		fprintf(stderr, "Fallo al crear el hilo monitor: %s\n", strerror(ret));
 		close(fd);
+		flock(lock_fd, LOCK_UN);
+		close(lock_fd);
 		return EXIT_FAILURE;
 	}
 
@@ -196,5 +216,7 @@ int main(void)
 	pthread_cancel(tid);
 	pthread_join(tid, NULL);
 	close(fd);
+	flock(lock_fd, LOCK_UN);
+	close(lock_fd);
 	return EXIT_SUCCESS;
 }
